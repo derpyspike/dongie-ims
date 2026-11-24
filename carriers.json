@@ -1,0 +1,11 @@
+[
+  {
+    "mcc": "214",
+    "mnc": "03",
+    "epdg": "epdg.epc.mnc003.mcc214.pub.3gppnetwork.org",
+    "dhGroups": [14, 2, 5],
+    "imsIPSecIntegrityAlgorithms": ["hmac-sha-1-96", "hmac-md5-96"],
+    "imsIPSecEncryptionAlgorithms": ["null", "aes-cbc"],
+    "imsIPSecModes": ["trans"]
+  }
+]
