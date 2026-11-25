@@ -33,7 +33,7 @@ import (
 //go:embed carriers.json
 var defaultCarriers []byte
 
-var version = "0.1.0"
+var version = "0.2.0"
 
 func main() {
 	var (
@@ -43,6 +43,8 @@ func main() {
 		carriers = flag.String("carriers", "", "carrier profile JSON (default: built-in Orange ES profile)")
 		imei     = flag.String("imei", "", "terminal IMEI (default: ask ModemManager)")
 		onCall   = flag.String("on-call", "ring", "incoming calls: ring (let it ring, network decides) or reject (486 Busy)")
+		stateDir = flag.String("state-dir", "/var/lib/dongie-ims", "persistent state (SIM crash guard)")
+		disabled = flag.String("disable-sims", "", "comma-separated SIM MCC+MNC codes to never touch (e.g. 26201)")
 		logLevel = flag.String("log-level", "info", "debug|info|warn|error (ims-go internals log at warn unless debug)")
 		showVer  = flag.Bool("version", false, "print version")
 	)
@@ -84,6 +86,7 @@ func main() {
 	defer stop()
 
 	st := newState(*onCall)
+	guard := newSIMGuard(*stateDir, *disabled, log)
 	br, err := newBridge(st, log)
 	if err != nil {
 		log.Error("webrtc", "err", err)
@@ -100,7 +103,7 @@ func main() {
 	backoff := 15 * time.Second
 	for ctx.Err() == nil {
 		started := time.Now()
-		err := runSession(ctx, st, br, sessionConfig{qmiDev: *qmiDev, imei: *imei, profiles: &profiles, log: log, imsLog: imsLog})
+		err := runSession(ctx, st, br, guard, sessionConfig{qmiDev: *qmiDev, imei: *imei, profiles: &profiles, log: log, imsLog: imsLog})
 		if ctx.Err() != nil {
 			break
 		}
@@ -108,6 +111,11 @@ func main() {
 		log.Warn("IMS session ended", "err", err, "retry_in", backoff)
 		if time.Since(started) > 10*time.Minute {
 			backoff = 15 * time.Second
+		}
+		if err != nil && strings.Contains(err.Error(), "loading USIM") {
+			// the SIM's files can't be read the way ims-go expects: don't keep
+			// poking the modem's SIM interface every few seconds
+			backoff = time.Hour
 		}
 		select {
 		case <-ctx.Done():
@@ -129,7 +137,28 @@ type sessionConfig struct {
 
 // runSession opens the modem, registers and serves events until the client
 // fails for good, stays unregistered too long, or ctx is cancelled.
-func runSession(ctx context.Context, st *state, br *bridge, c sessionConfig) error {
+func runSession(ctx context.Context, st *state, br *bridge, guard *simGuard, c sessionConfig) error {
+	// Which SIM is in? Asked from ModemManager, which doesn't touch the SIM's
+	// file system the way ims-go does.
+	code, err := simCode(ctx)
+	if err != nil {
+		return fmt.Errorf("SIM: %w", err)
+	}
+	st.setSIM(code)
+	if reason := guard.blocked(code); reason != "" {
+		st.setStatus("disabled")
+		st.noteError(errors.New(reason))
+		c.log.Warn("not touching this SIM", "sim", code, "reason", reason)
+		return waitSIMChange(ctx, code)
+	}
+	if err := guard.begin(code); err != nil {
+		return fmt.Errorf("SIM guard: %w", err)
+	}
+
+	// a clean return (error or not) means the SIM access didn't kill the stick;
+	// only a reset mid-way leaves the marker behind
+	defer guard.end(code)
+
 	imei := c.imei
 	if imei == "" {
 		var err error
@@ -147,11 +176,12 @@ func runSession(ctx context.Context, st *state, br *bridge, c sessionConfig) err
 		_ = tr.Close()
 		return fmt.Errorf("QMI client: %w", err)
 	}
-	reader, err := sim.NewQCOM(qc)
+	qcomReader, err := sim.NewQCOM(qc)
 	if err != nil {
 		_ = qc.Close()
 		return fmt.Errorf("SIM: %w", err)
 	}
+	reader := lenientSIM{qcomReader}
 	client, err := ims.New(reader, &ims.Config{
 		Carriers: c.profiles,
 		Terminal: ims.TerminalInfo{ID: imei},
@@ -193,6 +223,7 @@ func runSession(ctx context.Context, st *state, br *bridge, c sessionConfig) err
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
+	guard.end(code) // SIM access works for this SIM
 	if st.sync(client, "", nil) {
 		snap := st.snapshot()
 		c.log.Info("IMS registered", "inner_ip", snap.InnerIP, "pcscf", snap.PCSCF)
@@ -305,4 +336,58 @@ func parseLevel(s string) slog.Level {
 		return slog.LevelError
 	}
 	return slog.LevelInfo
+}
+
+// simCode returns the SIM's MCC+MNC from ModemManager (waits up to 2 min for
+// the PIN to be entered).
+func simCode(ctx context.Context) (string, error) {
+	deadline := time.Now().Add(2 * time.Minute)
+	for {
+		cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+		out, _ := exec.CommandContext(cctx, "mmcli", "-m", "any", "-K").Output()
+		cancel()
+		simPath := ""
+		for _, line := range strings.Split(string(out), "\n") {
+			k, v, ok := strings.Cut(line, ":")
+			if ok && strings.TrimSpace(k) == "modem.generic.sim" {
+				simPath = strings.TrimSpace(v)
+			}
+		}
+		if simPath != "" && simPath != "--" {
+			cctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+			out, _ := exec.CommandContext(cctx, "mmcli", "-i", simPath, "-K").Output()
+			cancel()
+			for _, line := range strings.Split(string(out), "\n") {
+				k, v, ok := strings.Cut(line, ":")
+				if ok && strings.TrimSpace(k) == "sim.properties.operator-code" {
+					if v = strings.TrimSpace(v); len(v) >= 5 && v != "--" {
+						return v, nil
+					}
+				}
+			}
+		}
+		if time.Now().After(deadline) {
+			return "", errors.New("operator code not readable (no SIM / PIN not entered?)")
+		}
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// waitSIMChange blocks until the SIM changes (a swap usually means a reboot,
+// but hot-swap or a modem reset is possible) or ctx ends.
+func waitSIMChange(ctx context.Context, code string) error {
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Minute):
+		}
+		if now, err := simCode(ctx); err == nil && now != code {
+			return fmt.Errorf("SIM changed %s -> %s", code, now)
+		}
+	}
 }

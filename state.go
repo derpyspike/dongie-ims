@@ -30,6 +30,7 @@ type Snapshot struct {
 	InnerIP       string   `json:"inner_ip,omitempty"`
 	PCSCF         []string `json:"pcscf,omitempty"`
 	OnCall        string   `json:"on_call"`
+	SIM           string   `json:"sim,omitempty"` // MCC+MNC of the inserted SIM
 	ActiveCalls   int      `json:"active_calls"`
 }
 
@@ -196,6 +197,9 @@ func (s *state) sync(c *ims.Client, status string, err error) bool {
 			s.snap.MSISDN = reg.MSISDN
 		}
 		s.snap.InnerIP = ipString(tun.InnerIPv4)
+		if s.snap.InnerIP == "" && !tun.InnerIPv6.IsZero() {
+			s.snap.InnerIP = tun.InnerIPv6.IP.String() // IPv6-only IMS (e.g. Telekom DE)
+		}
 		s.snap.PCSCF = nil
 		for _, ip := range tun.PCSCFIPs {
 			s.snap.PCSCF = append(s.snap.PCSCF, ip.String())
@@ -207,6 +211,12 @@ func (s *state) sync(c *ims.Client, status string, err error) bool {
 		}
 	}
 	return became
+}
+
+func (s *state) setSIM(code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap.SIM = code
 }
 
 func (s *state) setStatus(status string) {

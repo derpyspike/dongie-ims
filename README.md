@@ -18,7 +18,7 @@ through the stick's ordinary LTE data connection, while the modem handles only t
 authentication (EAP-AKA, through `qmi-proxy`). No routes, interfaces or modem profiles
 are changed, because the tunnel runs in userspace.
 
-**dongie** (dongie-rs, the EUPL-1.2 web dashboard) displays the status and
+[dongie](https://github.com/derpyspike/dongie-rs) (dongie-rs, the EUPL-1.2 web dashboard) displays the status and
 call log, and lets you **take and make calls in the browser**. Any SMS the network
 delivers over IMS is copied into dongie's Messages.
 
