@@ -18,7 +18,9 @@ const (
 // Snapshot is what GET /v1/status returns.
 type Snapshot struct {
 	Version       string   `json:"version"`
-	Access        string   `json:"access"`
+	Access        string   `json:"access"`             // vowifi | volte: what the current session uses
+	Mode          string   `json:"mode"`               // vowifi | volte | volte+vowifi | vowifi+volte
+	Fallback      bool     `json:"fallback,omitempty"` // running on the mode's second access
 	Status        string   `json:"status"`
 	Registered    bool     `json:"registered"`
 	Since         int64    `json:"since,omitempty"` // unix time of the current registration
@@ -43,13 +45,16 @@ type Call struct {
 	State      string   `json:"state"`
 	Ended      bool     `json:"ended"`
 	EndedAt    int64    `json:"ended_at,omitempty"`
-	Result     string   `json:"result"` // ringing | dialing | answered | missed | rejected | failed
+	Result     string   `json:"result"` // ringing | dialing | answered | voicemail | missed | rejected | failed
 	Cause      string   `json:"cause,omitempty"`
 	Codecs     []string `json:"codecs,omitempty"` // offered by the network
 	Codec      string   `json:"codec,omitempty"`  // bridged codec, e.g. "AMR-WB mode 2"
 	AnsweredAt int64    `json:"answered_at,omitempty"`
-	Browser    string   `json:"browser,omitempty"` // WebRTC state of the browser leg
+	Voicemail  string   `json:"voicemail,omitempty"`      // id of the recording (result "voicemail")
+	VoiceSecs  int      `json:"voicemail_secs,omitempty"` // its length
+	Browser    string   `json:"browser,omitempty"`        // WebRTC state of the browser leg
 	answered   bool
+	byVM       bool // taken by the stick's voicemail
 	rejected   bool
 }
 
@@ -70,6 +75,8 @@ type state struct {
 	nextCall uint64
 	nextSMS  uint64
 	client   *ims.Client
+	pdnIP    string   // VoLTE IMS PDN address
+	pdnPCSCF []string // VoLTE P-CSCFs (via PCO)
 }
 
 func (s *state) setClient(c *ims.Client) {
@@ -145,6 +152,46 @@ func (s *state) setBrowser(id uint64, st string) {
 	}
 }
 
+// claimRinging returns a ringing incoming call and marks it taken, so the
+// browser and the voicemail can't both answer it.
+func (s *state) claimRinging(id uint64) (*imsvoice.Call, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.entry(id)
+	call, ok := s.live[id]
+	if c == nil || !ok || c.Ended || c.Dir != "in" || c.answered || c.rejected {
+		return nil, false
+	}
+	c.answered = true
+	return call, true
+}
+
+func (s *state) markVoicemail(id uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c := s.entry(id); c != nil {
+		c.byVM, c.Result, c.State = true, "voicemail", "active"
+		if c.AnsweredAt == 0 {
+			c.AnsweredAt = time.Now().Unix()
+		}
+	}
+}
+
+func (s *state) setVoicemail(id uint64, vmID string, secs int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if c := s.entry(id); c != nil {
+		c.Voicemail, c.VoiceSecs = vmID, secs
+	}
+}
+
+func (s *state) callEnded(id uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.entry(id)
+	return c == nil || c.Ended
+}
+
 // ringingCall returns an incoming call that can still be answered.
 func (s *state) ringingCall(id uint64) (*imsvoice.Call, bool) {
 	s.mu.Lock()
@@ -160,7 +207,7 @@ func (s *state) ringingCall(id uint64) (*imsvoice.Call, bool) {
 func newState(onCall string) *state {
 	return &state{
 		onCall: onCall,
-		snap:   Snapshot{Version: version, Access: "vowifi", Status: "starting", Started: time.Now().Unix(), OnCall: onCall},
+		snap:   Snapshot{Version: version, Access: accessVoWiFi, Mode: defaultMode, Status: "starting", Started: time.Now().Unix(), OnCall: onCall},
 		live:   map[uint64]*imsvoice.Call{},
 	}
 }
@@ -196,13 +243,19 @@ func (s *state) sync(c *ims.Client, status string, err error) bool {
 		if reg.MSISDN != "" {
 			s.snap.MSISDN = reg.MSISDN
 		}
-		s.snap.InnerIP = ipString(tun.InnerIPv4)
-		if s.snap.InnerIP == "" && !tun.InnerIPv6.IsZero() {
-			s.snap.InnerIP = tun.InnerIPv6.IP.String() // IPv6-only IMS (e.g. Telekom DE)
-		}
-		s.snap.PCSCF = nil
-		for _, ip := range tun.PCSCFIPs {
-			s.snap.PCSCF = append(s.snap.PCSCF, ip.String())
+		if s.snap.Access == accessVoLTE {
+			// no tunnel: the IMS PDN's address and P-CSCFs (p2pNetwork)
+			s.snap.InnerIP = s.pdnIP
+			s.snap.PCSCF = append([]string(nil), s.pdnPCSCF...)
+		} else {
+			s.snap.InnerIP = ipString(tun.InnerIPv4)
+			if s.snap.InnerIP == "" && !tun.InnerIPv6.IsZero() {
+				s.snap.InnerIP = tun.InnerIPv6.IP.String() // IPv6-only IMS (e.g. Telekom DE)
+			}
+			s.snap.PCSCF = nil
+			for _, ip := range tun.PCSCFIPs {
+				s.snap.PCSCF = append(s.snap.PCSCF, ip.String())
+			}
 		}
 	} else {
 		s.snap.Since = 0
@@ -211,6 +264,27 @@ func (s *state) sync(c *ims.Client, status string, err error) bool {
 		}
 	}
 	return became
+}
+
+// setAccess records the access the next session uses.
+func (s *state) setAccess(access, mode string, fallback bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.snap.Access, s.snap.Mode, s.snap.Fallback = access, mode, fallback
+	s.pdnIP, s.pdnPCSCF = "", nil
+}
+
+// setPDN records the VoLTE IMS PDN (from p2pNetwork.Replace).
+func (s *state) setPDN(ip string, pcscf []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pdnIP, s.pdnPCSCF = ip, pcscf
+}
+
+func (s *state) activeCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.live)
 }
 
 func (s *state) setSIM(code string) {
@@ -301,16 +375,20 @@ func (s *state) callEvent(ev ims.CallEvent) *Call {
 	c.State = string(ev.State)
 	switch ev.State {
 	case imsvoice.CallStateActive, imsvoice.CallStateConfirmed:
-		if !c.answered {
+		if c.AnsweredAt == 0 {
 			c.AnsweredAt = time.Now().Unix()
 		}
 		c.answered = true
-		c.Result = "answered"
+		if !c.byVM {
+			c.Result = "answered"
+		}
 	case imsvoice.CallStateEnded, imsvoice.CallStateFailed:
 		c.Ended = true
 		c.EndedAt = time.Now().Unix()
 		c.Cause = ev.Cause
 		switch {
+		case c.byVM:
+			c.Result = "voicemail"
 		case c.answered:
 			c.Result = "answered"
 		case c.rejected:

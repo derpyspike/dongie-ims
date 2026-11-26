@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -28,12 +29,13 @@ import (
 	"github.com/damonto/wwan-go/qcom"
 	"github.com/damonto/wwan-go/qcom/qmi"
 	"github.com/damonto/wwan-go/sim"
+	simcard "github.com/damonto/wwan-go/sim/card"
 )
 
 //go:embed carriers.json
 var defaultCarriers []byte
 
-var version = "0.2.0"
+var version = "0.3.0"
 
 func main() {
 	var (
@@ -46,6 +48,9 @@ func main() {
 		stateDir = flag.String("state-dir", "/var/lib/dongie-ims", "persistent state (SIM crash guard)")
 		disabled = flag.String("disable-sims", "", "comma-separated SIM MCC+MNC codes to never touch (e.g. 26201)")
 		logLevel = flag.String("log-level", "info", "debug|info|warn|error (ims-go internals log at warn unless debug)")
+		vmFile   = flag.String("voicemail-file", "/var/lib/dongie/ims-voicemail.json", "voicemail settings, written by dongie (missing = off)")
+		greetWAV = flag.String("greeting", "/var/lib/dongie/ims-greeting.wav", "voicemail greeting: WAV, PCM 16-bit mono 16 kHz (dongie converts uploads)")
+		modeFile = flag.String("mode-file", "/var/lib/dongie/ims-mode", "access mode chosen in dongie: vowifi | volte | volte+vowifi | vowifi+volte (missing = vowifi)")
 		showVer  = flag.Bool("version", false, "print version")
 	)
 	flag.Parse()
@@ -92,7 +97,9 @@ func main() {
 		log.Error("webrtc", "err", err)
 		os.Exit(1)
 	}
-	srv, err := serveAPI(*socket, *group, st, br, log)
+	reload := make(chan struct{}, 1)
+	vm := &voicemail{st: st, log: log, configPath: *vmFile, greeting: *greetWAV, flashDir: filepath.Join(*stateDir, "voicemail")}
+	srv, err := serveAPI(*socket, *group, st, br, vm, reload, log)
 	if err != nil {
 		log.Error("api socket", "err", err)
 		os.Exit(1)
@@ -100,15 +107,89 @@ func main() {
 	defer srv.Close()
 	log.Info("dongie-ims started", "version", version, "socket", *socket, "on_call", *onCall)
 
+	mode := readMode(*modeFile)
+	idx := 0 // position in modeOrder[mode]: 0 = primary, 1 = fallback
 	backoff := 15 * time.Second
 	for ctx.Err() == nil {
+		order := modeOrder[mode]
+		if idx >= len(order) {
+			idx = 0
+		}
+		access := order[idx]
+		st.setAccess(access, mode, idx > 0)
+		log.Info("IMS session", "access", access, "mode", mode, "fallback", idx > 0)
+
+		// a mode change (dongie: POST /v1/mode/reload) or, on the fallback, a
+		// periodic retry of the primary access (only while no call is up) ends
+		// the session early
+		sctx, cancel := context.WithCancel(ctx)
+		why := make(chan string, 1)
+		done := make(chan struct{})
+		go func(onFallback bool) {
+			var retry <-chan time.Time
+			if onFallback {
+				t := time.NewTicker(primaryRetry)
+				defer t.Stop()
+				retry = t.C
+			}
+			for {
+				select {
+				case <-done:
+					return
+				case <-reload:
+					why <- "mode"
+					cancel()
+					return
+				case <-retry:
+					if st.activeCalls() == 0 {
+						why <- "primary"
+						cancel()
+						return
+					}
+				}
+			}
+		}(idx > 0)
 		started := time.Now()
-		err := runSession(ctx, st, br, guard, sessionConfig{qmiDev: *qmiDev, imei: *imei, profiles: &profiles, log: log, imsLog: imsLog})
+		err := runSession(sctx, access, st, br, vm, guard, sessionConfig{qmiDev: *qmiDev, imei: *imei, profiles: &profiles, log: log, imsLog: imsLog})
+		close(done)
+		cancel()
 		if ctx.Err() != nil {
 			break
 		}
+		reason := ""
+		select {
+		case reason = <-why:
+		default:
+		}
+		switch reason {
+		case "mode":
+			if m := readMode(*modeFile); m != mode {
+				log.Info("mode changed", "from", mode, "to", m)
+				mode = m
+			}
+			idx, backoff = 0, 15*time.Second
+			st.setDown(errors.New("mode changed"))
+			continue
+		case "primary":
+			log.Info("retrying the primary access", "access", order[0])
+			idx = 0
+			st.setDown(errors.New("retrying " + order[0]))
+			continue
+		}
 		st.setDown(err)
-		log.Warn("IMS session ended", "err", err, "retry_in", backoff)
+		if len(order) > 1 && idx == 0 {
+			// primary failed: fall back right away
+			log.Warn("IMS session ended, falling back", "access", access, "err", err, "fallback", order[1])
+			idx = 1
+			if !sleepOrReload(ctx, 5*time.Second, reload, &mode, *modeFile, &idx) {
+				break
+			}
+			continue
+		}
+		if len(order) > 1 {
+			idx = 0 // fallback failed too: next round starts with the primary again
+		}
+		log.Warn("IMS session ended", "access", access, "err", err, "retry_in", backoff)
 		if time.Since(started) > 10*time.Minute {
 			backoff = 15 * time.Second
 		}
@@ -117,14 +198,31 @@ func main() {
 			// poking the modem's SIM interface every few seconds
 			backoff = time.Hour
 		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(backoff):
+		if !sleepOrReload(ctx, backoff, reload, &mode, *modeFile, &idx) {
+			break
 		}
 		backoff = min(backoff*2, 5*time.Minute)
 	}
 	st.setDown(errors.New("stopped"))
 	log.Info("dongie-ims stopped")
+}
+
+// primaryRetry: while on the fallback access, how often to try the primary
+// again (skipped while a call is up).
+const primaryRetry = 15 * time.Minute
+
+// sleepOrReload waits d; a mode change ends the wait early (and resets to the
+// new mode's primary). It returns false when ctx ended.
+func sleepOrReload(ctx context.Context, d time.Duration, reload <-chan struct{}, mode *string, modeFile string, idx *int) bool {
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(d):
+	case <-reload:
+		*mode = readMode(modeFile)
+		*idx = 0
+	}
+	return true
 }
 
 type sessionConfig struct {
@@ -137,7 +235,7 @@ type sessionConfig struct {
 
 // runSession opens the modem, registers and serves events until the client
 // fails for good, stays unregistered too long, or ctx is cancelled.
-func runSession(ctx context.Context, st *state, br *bridge, guard *simGuard, c sessionConfig) error {
+func runSession(ctx context.Context, access string, st *state, br *bridge, vm *voicemail, guard *simGuard, c sessionConfig) error {
 	// Which SIM is in? Asked from ModemManager, which doesn't touch the SIM's
 	// file system the way ims-go does.
 	code, err := simCode(ctx)
@@ -167,29 +265,32 @@ func runSession(ctx context.Context, st *state, br *bridge, guard *simGuard, c s
 		}
 	}
 	st.setStatus("connecting")
-	tr, err := qmi.Open(ctx, qmi.WithProxy(c.qmiDev))
-	if err != nil {
-		return fmt.Errorf("opening QMI: %w", err)
+	var (
+		reader      simcard.Reader
+		accessCfg   ims.AccessConfig
+		closeAccess func()
+	)
+	switch access {
+	case accessVoLTE:
+		reader, accessCfg, closeAccess, err = openVoLTE(ctx, st, c)
+		if err != nil {
+			return fmt.Errorf("VoLTE: %w", err)
+		}
+	default:
+		reader, closeAccess, err = openVoWiFi(ctx, c)
+		if err != nil {
+			return err
+		}
+		accessCfg = ims.VoWiFi(ims.VoWiFiConfig{})
 	}
-	qc, err := qcom.NewClient(tr, qcom.WithSlot(1))
-	if err != nil {
-		_ = tr.Close()
-		return fmt.Errorf("QMI client: %w", err)
-	}
-	qcomReader, err := sim.NewQCOM(qc)
-	if err != nil {
-		_ = qc.Close()
-		return fmt.Errorf("SIM: %w", err)
-	}
-	reader := lenientSIM{qcomReader}
 	client, err := ims.New(reader, &ims.Config{
 		Carriers: c.profiles,
 		Terminal: ims.TerminalInfo{ID: imei},
 		Logger:   c.imsLog,
-		Access:   ims.VoWiFi(ims.VoWiFiConfig{}),
+		Access:   accessCfg,
 	})
 	if err != nil {
-		_ = reader.Close()
+		closeAccess()
 		return fmt.Errorf("IMS client: %w", err)
 	}
 	st.setClient(client)
@@ -207,7 +308,7 @@ func runSession(ctx context.Context, st *state, br *bridge, guard *simGuard, c s
 		case <-cctx.Done():
 			c.log.Warn("IMS close timed out")
 		}
-		_ = reader.Close()
+		closeAccess()
 	}()
 
 	events := client.Events()
@@ -270,6 +371,8 @@ func runSession(ctx context.Context, st *state, br *bridge, guard *simGuard, c s
 					defer cancel()
 					_ = in.Call.Reject(rctx, 486, "Busy Here")
 				}()
+			} else {
+				go vm.maybeTake(ctx, id, in) // does nothing unless voicemail is on
 			}
 		case ev, ok := <-voice.Events:
 			if ok {
@@ -298,6 +401,27 @@ func runSession(ctx context.Context, st *state, br *bridge, guard *simGuard, c s
 			}
 		}
 	}
+}
+
+// openVoWiFi: SIM access through ModemManager's QMI port (qmi-proxy); the
+// SWu/IPsec tunnel itself runs in userspace over whatever internet there is.
+func openVoWiFi(ctx context.Context, c sessionConfig) (simcard.Reader, func(), error) {
+	tr, err := qmi.Open(ctx, qmi.WithProxy(c.qmiDev))
+	if err != nil {
+		return nil, nil, fmt.Errorf("opening QMI: %w", err)
+	}
+	qc, err := qcom.NewClient(tr, qcom.WithSlot(1))
+	if err != nil {
+		_ = tr.Close()
+		return nil, nil, fmt.Errorf("QMI client: %w", err)
+	}
+	qcomReader, err := sim.NewQCOM(qc)
+	if err != nil {
+		_ = qc.Close()
+		return nil, nil, fmt.Errorf("SIM: %w", err)
+	}
+	reader := lenientSIM{qcomReader}
+	return reader, func() { _ = reader.Close() }, nil
 }
 
 func modemIMEI(ctx context.Context) (string, error) {

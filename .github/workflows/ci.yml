@@ -21,16 +21,19 @@ jobs:
           go-version-file: go.mod
 
       - name: gofmt
-        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+        run: test -z "$(gofmt -l $(git ls-files '*.go'))" || { gofmt -l $(git ls-files '*.go'); exit 1; }
+
+      - name: Vendor modules + apply patches/ (ims-go ESP fix)
+        run: scripts/vendor.sh
 
       - name: go vet
-        run: go vet ./...
+        run: go vet -mod=vendor ./...
 
       - name: Tests
-        run: go test ./...
+        run: go test -mod=vendor ./...
 
       - name: Build for the stick (static arm64)
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o dongie-ims .
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -mod=vendor -trimpath -ldflags='-s -w' -o dongie-ims .
 
       - name: Check the binary is static aarch64
         run: |

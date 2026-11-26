@@ -328,9 +328,9 @@ func (b *bridge) callEnded(entry uint64) {
 
 // answer: browser picks up a ringing incoming call.
 func (b *bridge) answer(id uint64, offer string) (string, error) {
-	call, ok := b.st.ringingCall(id)
+	call, ok := b.st.claimRinging(id) // not also taken by the voicemail
 	if !ok {
-		return "", errors.New("no such ringing call")
+		return "", errors.New("no such ringing call (or the voicemail took it)")
 	}
 	s, sdp, err := b.open(offer, id)
 	if err != nil {

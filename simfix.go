@@ -58,7 +58,18 @@ func fixEFDirRecord(rec []byte) []byte {
 }
 
 func (r lenientSIM) ReadRecord(ctx context.Context, req simcard.RecordRead) ([]byte, error) {
-	b, err := r.QCOM.ReadRecord(ctx, req)
+	return lenientReadRecord(ctx, r.QCOM, req)
+}
+
+// recordReader is the part of a SIM reader the EF_DIR repair needs; both
+// *sim.QCOM (VoWiFi) and *ims.QCOMClient (VoLTE) have it.
+type recordReader interface {
+	ReadRecord(ctx context.Context, req simcard.RecordRead) ([]byte, error)
+	FileAttributes(ctx context.Context, f simcard.FileRef) (simcard.FileAttributes, error)
+}
+
+func lenientReadRecord(ctx context.Context, base recordReader, req simcard.RecordRead) ([]byte, error) {
+	b, err := base.ReadRecord(ctx, req)
 	if err == nil && isEFDir(req.File) {
 		b = fixEFDirRecord(b)
 	}
@@ -68,6 +79,11 @@ func (r lenientSIM) ReadRecord(ctx context.Context, req simcard.RecordRead) ([]b
 // ListApplications is QCOM.ListApplications, reading the records through the
 // repairing ReadRecord above.
 func (r lenientSIM) ListApplications(ctx context.Context) ([]simcard.Application, error) {
+	return lenientListApplications(ctx, r)
+}
+
+// lenientListApplications reads EF_DIR through r's (repairing) ReadRecord.
+func lenientListApplications(ctx context.Context, r recordReader) ([]simcard.Application, error) {
 	ef := simcard.FileRef{Path: efDirPath}
 	attrs, err := r.FileAttributes(ctx, ef)
 	if err != nil {

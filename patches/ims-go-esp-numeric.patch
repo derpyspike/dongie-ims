@@ -1,0 +1,20 @@
+# ims-go: open the raw ESP socket by protocol number. With CGO_ENABLED=0 the
+# "esp" name lookup fails on the stick ("unknown IP protocol specified") even
+# though /etc/protocols has it; "ip4:50" works (tested 2026-11-26, Go 1.27.3).
+# Drop once fixed upstream. Applied by scripts/vendor.sh.
+diff --git a/lte/ipsec/session.go b/lte/ipsec/session.go
+index f59d927..a501e05 100644
+--- a/lte/ipsec/session.go
++++ b/lte/ipsec/session.go
+@@ -395,9 +395,9 @@ func (systemPacketListener) ListenUDPPacket(ctx context.Context, local *net.UDPA
+ }
+ 
+ func listenESP(ctx context.Context, listener PacketListener, localIP net.IP) (packetConn, error) {
+-	network := "ip6:esp"
++	network := "ip6:50" // numeric: static Go builds may not resolve "esp"
+ 	if localIP.To4() != nil {
+-		network = "ip4:esp"
++		network = "ip4:50"
+ 	}
+ 	conn, err := listener.ListenIPPacket(ctx, network, &net.IPAddr{IP: append(net.IP(nil), localIP...)})
+ 	if err != nil {

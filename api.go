@@ -26,7 +26,7 @@ import (
 //	POST /v1/calls/{id}/hangup  end the browser call / cancel dialing
 //	POST /v1/calls/{id}/dtmf    {"digits": "123#"}
 //	POST /v1/dial               {"to": "+34…", "sdp": offer} -> {"id", "sdp"}
-func serveAPI(path, group string, st *state, br *bridge, log *slog.Logger) (*http.Server, error) {
+func serveAPI(path, group string, st *state, br *bridge, vm *voicemail, reload chan<- struct{}, log *slog.Logger) (*http.Server, error) {
 	_ = os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
@@ -52,6 +52,36 @@ func serveAPI(path, group string, st *state, br *bridge, log *slog.Logger) (*htt
 	}
 
 	mux := http.NewServeMux()
+	// dongie wrote a new mode into the mode file: switch now (ends the current
+	// session, also during a call: dongie asks the user before)
+	mux.HandleFunc("POST /v1/mode/reload", func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case reload <- struct{}{}:
+		default:
+		}
+		writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+	})
+	// voicemail: list, play (WAV), delete. Settings and greeting are files dongie writes.
+	mux.HandleFunc("GET /v1/voicemail", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"voicemail": vm.list(), "config": readVMConfig(vm.configPath)})
+	})
+	mux.HandleFunc("GET /v1/voicemail/{id}", func(w http.ResponseWriter, r *http.Request) {
+		b, err := vm.wav(strings.TrimSuffix(r.PathValue("id"), ".wav"))
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such voicemail"})
+			return
+		}
+		w.Header().Set("Content-Type", "audio/wav")
+		w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+		_, _ = w.Write(b)
+	})
+	mux.HandleFunc("DELETE /v1/voicemail/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if !vm.remove(r.PathValue("id")) {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no such voicemail"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	})
 	mux.HandleFunc("GET /v1/status", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, st.snapshot())
 	})

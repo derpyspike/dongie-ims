@@ -12,6 +12,8 @@ RestartSec=30
 RuntimeDirectory=dongie-ims
 StateDirectory=dongie-ims
 RuntimeDirectoryMode=0755
+# keep /run/dongie-ims (voicemails kept in RAM) across restarts, until reboot
+RuntimeDirectoryPreserve=yes
 Environment=GOMEMLIMIT=40MiB GOGC=50
 MemoryMax=96M
 NoNewPrivileges=yes
