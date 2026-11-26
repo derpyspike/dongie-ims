@@ -7,6 +7,7 @@ require (
 	github.com/damonto/wwan-go v0.0.2-0.20261122042609-38511a4c1880
 	github.com/pion/rtp v1.10.6
 	github.com/pion/webrtc/v4 v4.2.29
+	golang.org/x/sys v0.50.0
 )
 
 require (
@@ -27,9 +28,8 @@ require (
 	github.com/pion/transport/v5 v5.1.5 // indirect
 	github.com/pion/turn/v5 v5.1.3 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
-	golang.org/x/crypto v0.48.0 // indirect
-	golang.org/x/net v0.50.0 // indirect
-	golang.org/x/sys v0.50.0 // indirect
+	golang.org/x/crypto v0.52.0 // indirect
+	golang.org/x/net v0.54.0 // indirect
 	golang.org/x/text v0.44.0 // indirect
 	golang.org/x/time v0.14.0 // indirect
 )
